@@ -2,6 +2,8 @@ import express from 'express';
 import mongoose from 'mongoose';
 import { authMiddleware } from '../middleware/auth.js';
 import { check, validationResult } from 'express-validator';
+import InventoryTransaction from '../../models/InventoryTransaction.js';
+import LoyaltyPoints from '../../models/LoyaltyPoints.js';
 
 const router = express.Router();
 const Product = mongoose.model('Product');
@@ -65,12 +67,16 @@ router.get('/', authMiddleware, async (req, res) => {
       filter.status = status;
     }
     
-    // Filter by client uploaded status
+    // Handle client uploaded status based on user role
     if (isClientUploaded !== undefined) {
-      // Convert string 'true'/'false' to boolean
       const boolValue = isClientUploaded === 'true' || isClientUploaded === true;
       filter.isClientUploaded = boolValue;
-      console.log(`Filtering products by isClientUploaded=${boolValue}`);
+    } else if (req.user.role === 'client') {
+      // For clients, show both admin products and their own products
+      filter.$or = [
+        { isClientUploaded: false }, // Admin products
+        { isClientUploaded: true, createdBy: req.user._id } // Client's own products
+      ];
     }
     
     // Filter by creator
@@ -89,12 +95,6 @@ router.get('/', authMiddleware, async (req, res) => {
     
     // Process client inventory filter
     if (hasClientInventory === 'true' && clientId) {
-      // This is a special case to find products that have client inventory
-      // We need to find products either:
-      // 1. Created by this client (isClientUploaded = true)
-      // 2. OR products that have clientInventory with currentStock > 0
-      // 3. OR products that match this client's createdBy field
-      // 4. OR products with clientInventory.initialStock defined
       console.log(`Finding client inventory products for client: ${clientId}`);
       
       // Convert clientId to ObjectId if it's a valid ObjectId string
@@ -104,22 +104,18 @@ router.get('/', authMiddleware, async (req, res) => {
         console.log(`Converted clientId to ObjectId: ${clientIdObj}`);
       }
       
-      // Replace the single filter with a more comprehensive $or condition
+      // For client inventory, show both admin products and client's own products
       filter.$or = [
-        // Option 1: Products with client inventory (even with zero stock)
-        { 'clientInventory.initialStock': { $exists: true } },
+        // Admin products (not client uploaded)
+        { isClientUploaded: false },
         
-        // Option 2: Products with current stock
-        { 'clientInventory.currentStock': { $exists: true } },
-        
-        // Option 3: Products directly created/uploaded by this client
+        // Client's own products
         { isClientUploaded: true, createdBy: clientIdObj },
         
-        // Option 4: Allow string ID comparison for older records
-        { isClientUploaded: true, createdBy: clientId },
+        // Products with client inventory
+        { 'clientInventory.initialStock': { $exists: true } },
+        { 'clientInventory.currentStock': { $exists: true } }
       ];
-      
-      console.log('Using expanded client inventory filter:', JSON.stringify(filter.$or));
     }
 
     // Get total count for pagination
@@ -394,6 +390,10 @@ router.get('/purchase-requests/:id', authMiddleware, async (req, res) => {
 // @desc     Approve a purchase request
 // @access   Private (Admin)
 router.post('/purchase-requests/:id/approve', authMiddleware, async (req, res) => {
+  // Start a MongoDB session for transaction
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
   try {
     console.log(`[APPROVE] Processing approval for purchase request: ${req.params.id}`);
     
@@ -403,8 +403,10 @@ router.post('/purchase-requests/:id/approve', authMiddleware, async (req, res) =
     }
 
     // 2. Find the purchase request
-    const request = await PurchaseRequest.findById(req.params.id);
+    const request = await PurchaseRequest.findById(req.params.id).session(session);
     if (!request) {
+      await session.abortTransaction();
+      session.endSession();
       return res.status(404).json({ message: 'Purchase request not found' });
     }
     
@@ -417,14 +419,18 @@ router.post('/purchase-requests/:id/approve', authMiddleware, async (req, res) =
 
     // 3. Verify request is pending
     if (request.status !== 'pending') {
+      await session.abortTransaction();
+      session.endSession();
       return res.status(400).json({ 
         message: `Purchase request cannot be approved. Current status: ${request.status}` 
       });
     }
 
     // 4. Find admin product
-    const adminProduct = await Product.findById(request.productId);
+    const adminProduct = await Product.findById(request.productId).session(session);
     if (!adminProduct) {
+      await session.abortTransaction();
+      session.endSession();
       return res.status(404).json({ message: 'Admin product not found' });
     }
     
@@ -436,6 +442,8 @@ router.post('/purchase-requests/:id/approve', authMiddleware, async (req, res) =
 
     // 5. Check stock availability
     if (adminProduct.stock < request.quantity) {
+      await session.abortTransaction();
+      session.endSession();
       return res.status(400).json({ 
         message: 'Not enough stock available', 
         available: adminProduct.stock, 
@@ -447,24 +455,28 @@ router.post('/purchase-requests/:id/approve', authMiddleware, async (req, res) =
     const clientId = typeof request.clientId === 'object' ? 
       (request.clientId._id || request.clientId.id) : 
       request.clientId;
-
-    // 7. Find or create client product
+    
+    // Check if admin is approving their own request
+    const isAdminSelfApproval = req.user._id.toString() === clientId.toString();
+    console.log(`[APPROVE] Admin self approval check: ${isAdminSelfApproval}`);
+    console.log(`[APPROVE] User ID: ${req.user._id}, Client ID: ${clientId}`);
+    
+    // For admin self-approval, use the admin's own ID for the client product
+    const effectiveClientId = isAdminSelfApproval ? req.user._id : clientId;
+    
+    // 7. Find or create client product based on the admin product
     let clientProduct = await Product.findOne({
       name: adminProduct.name,
-      'clientInventory.initialStock': { $exists: true },
-      createdBy: clientId
-    });
+      createdBy: effectiveClientId
+    }).session(session);
     
     let isNewClientProduct = false;
     
-    // If client product doesn't exist, create one
     if (!clientProduct) {
-      console.log(`[APPROVE] Creating new client product for client ${clientId}`);
+      // Create a new client product
       isNewClientProduct = true;
-      
-      // Generate a unique SKU with timestamp
       const uniqueSuffix = Date.now().toString().substring(8) + Math.floor(Math.random() * 10000);
-      const clientSku = `CLIENT-${adminProduct.sku}-${uniqueSuffix}`;
+      const clientSku = `CLIENT-${adminProduct.sku || 'PROD'}-${uniqueSuffix}`;
       
       clientProduct = new Product({
         name: adminProduct.name,
@@ -473,10 +485,13 @@ router.post('/purchase-requests/:id/approve', authMiddleware, async (req, res) =
         category: adminProduct.category,
         price: adminProduct.price,
         loyaltyPoints: adminProduct.loyaltyPoints,
-        stock: request.quantity, // Set regular stock as well for proper display
+        stock: request.quantity,
         isClientUploaded: true,
-        createdBy: clientId,
+        createdBy: effectiveClientId,
         organizationId: request.organizationId || adminProduct.organizationId,
+        images: adminProduct.images || [],
+        specifications: adminProduct.specifications || [],
+        status: 'active',
         clientInventory: {
           initialStock: request.quantity,
           currentStock: request.quantity,
@@ -485,34 +500,114 @@ router.post('/purchase-requests/:id/approve', authMiddleware, async (req, res) =
         }
       });
     } else {
-      // Update existing client product inventory
-      console.log(`[APPROVE] Updating existing client product: ${clientProduct._id}`);
-      console.log(`Current stock: ${clientProduct.clientInventory.currentStock}, Adding: ${request.quantity}`);
+      // Update existing client product
+      if (!clientProduct.clientInventory) {
+        clientProduct.clientInventory = {
+          initialStock: request.quantity,
+          currentStock: request.quantity,
+          reorderLevel: adminProduct.reorderLevel || 5,
+          lastUpdated: new Date()
+        };
+      } else {
+        const previousStock = clientProduct.clientInventory.currentStock;
+        clientProduct.clientInventory.currentStock += request.quantity;
+        clientProduct.clientInventory.lastUpdated = new Date();
+      }
       
-      clientProduct.clientInventory.currentStock += request.quantity;
-      clientProduct.clientInventory.lastUpdated = new Date();
-      // Also update regular stock field for consistency and proper display
+      // Update regular stock field as well
       clientProduct.stock = (clientProduct.stock || 0) + request.quantity;
     }
 
-    // 8. Make all database updates in sequence
+    // 8. Calculate and award loyalty points based on the product's loyalty points and quantity
+    const loyaltyPointsToAward = (adminProduct.loyaltyPoints || 0) * request.quantity;
+    let loyaltyPointsRecord = null;
+    let loyaltyPointsAwarded = false;
+    
+    if (loyaltyPointsToAward > 0) {
+      try {
+        console.log(`[APPROVE] Awarding ${loyaltyPointsToAward} loyalty points to client ${clientId}`);
+        
+        // Find or create loyalty points record for this client
+        loyaltyPointsRecord = await LoyaltyPoints.findOrCreate(clientId);
+        
+        // Add the loyalty points with transaction data
+        await loyaltyPointsRecord.addPoints(loyaltyPointsToAward, {
+          description: `Loyalty points for purchase of ${request.quantity} ${adminProduct.name}`,
+          referenceId: request._id,
+          referenceType: 'purchase_request',
+          productId: adminProduct._id,
+          metadata: {
+            productName: adminProduct.name,
+            quantity: request.quantity,
+            pointsPerUnit: adminProduct.loyaltyPoints || 0
+          }
+        });
+        
+        loyaltyPointsAwarded = true;
+        console.log(`[APPROVE] Successfully awarded loyalty points. New balance: ${loyaltyPointsRecord.points}`);
+      } catch (loyaltyError) {
+        // Log error but continue with the rest of the process
+        console.error(`[APPROVE] Error awarding loyalty points:`, loyaltyError);
+      }
+    } else {
+      console.log(`[APPROVE] No loyalty points to award for this product (points: ${adminProduct.loyaltyPoints || 0})`);
+    }
+
+    // 9. Make all database updates in sequence within the transaction
 
     // Step 1: Save client product (add stock to client)
-    await clientProduct.save();
-    console.log(`[APPROVE] Client product saved, new stock: ${clientProduct.clientInventory.currentStock}`);
+    await clientProduct.save({ session });
+    console.log(`[APPROVE] Client product saved, new quantity: ${clientProduct.clientInventory?.currentStock || clientProduct.stock}`);
     
-    // Step 2: Update admin product (reduce stock from admin)
+    // Step 2: Create admin transaction record (reducing stock)
     const previousAdminStock = adminProduct.stock;
+    
+    const adminTransaction = new InventoryTransaction({
+      transactionType: 'admin_deduction',
+      productId: adminProduct._id,
+      quantity: -request.quantity, // Negative because we're reducing
+      previousQuantity: previousAdminStock,
+      newQuantity: previousAdminStock - request.quantity,
+      userId: req.user._id,
+      clientId: clientId,
+      purchaseRequestId: request._id,
+      notes: `Stock deduction for purchase request ${request._id}${isAdminSelfApproval ? ' (admin self-approval)' : ''}`
+    });
+    
+    await adminTransaction.save({ session });
+    console.log(`[APPROVE] Admin inventory transaction recorded`);
+    
+    // Step 3: Create client transaction record (adding stock)
+    const clientTransaction = new InventoryTransaction({
+      transactionType: 'client_allocation',
+      productId: adminProduct._id,
+      quantity: request.quantity,
+      previousQuantity: clientProduct.stock - request.quantity,
+      newQuantity: clientProduct.stock,
+      userId: req.user._id,
+      clientId: clientId,
+      purchaseRequestId: request._id,
+      notes: `Stock allocation from purchase request ${request._id}${isAdminSelfApproval ? ' (admin self-approval)' : ''}`
+    });
+    
+    await clientTransaction.save({ session });
+    console.log(`[APPROVE] Client inventory transaction recorded`);
+    
+    // Step 4: Update admin product stock
     adminProduct.stock -= request.quantity;
-    await adminProduct.save();
+    await adminProduct.save({ session });
     console.log(`[APPROVE] Admin product stock updated: ${previousAdminStock} -> ${adminProduct.stock}`);
     
-    // Step 3: Update purchase request status
+    // Step 5: Update purchase request status
     request.status = 'approved';
-    await request.save();
+    await request.save({ session });
     console.log(`[APPROVE] Purchase request status updated to approved`);
     
-    // 9. Send success response
+    // 10. Commit the transaction
+    await session.commitTransaction();
+    session.endSession();
+    
+    // 11. Send success response with loyalty points information
     res.json({
       message: 'Purchase request approved successfully',
       request: {
@@ -527,12 +622,22 @@ router.post('/purchase-requests/:id/approve', authMiddleware, async (req, res) =
       },
       clientProduct: {
         id: clientProduct._id,
-        name: clientProduct.name,
-        stock: clientProduct.clientInventory.currentStock,
+        productId: adminProduct._id,
+        productName: adminProduct.name,
+        quantity: clientProduct.clientInventory?.currentStock || clientProduct.stock,
         isNew: isNewClientProduct
-      }
+      },
+      loyaltyPoints: loyaltyPointsAwarded ? {
+        awarded: loyaltyPointsToAward,
+        newBalance: loyaltyPointsRecord.points
+      } : null,
+      isAdminSelfApproval: isAdminSelfApproval
     });
   } catch (err) {
+    // Abort transaction on error
+    await session.abortTransaction();
+    session.endSession();
+    
     console.error('[APPROVE] Error:', err);
     res.status(500).json({ 
       message: 'Server error during purchase request approval',
@@ -667,40 +772,39 @@ router.post('/purchase-requests/:id/reliable-approve', authMiddleware, async (re
       console.log(`[RELIABLE-APPROVE] ClientId is not a valid ObjectId: ${clientId}`);
     }
     
+    // Check if admin is approving their own request
+    const isAdminSelfApproval = req.user._id.toString() === clientId.toString();
+    console.log(`[RELIABLE-APPROVE] Admin self approval check: ${isAdminSelfApproval}`);
+    console.log(`[RELIABLE-APPROVE] User ID: ${req.user._id}, Client ID: ${clientId}`);
+
+    // For admin self-approval, use the admin's own ID for the client product
+    const effectiveClientId = isAdminSelfApproval ? req.user._id : clientObjectId;
+    
     console.log(`[RELIABLE-APPROVE] Final clientId values for lookup:`, {
       originalClientId: request.clientId,
       extractedClientId: clientId,
       convertedObjectId: clientObjectId,
       clientIdType: typeof clientId,
-      isValidObjectId: mongoose.Types.ObjectId.isValid(clientId)
+      isValidObjectId: mongoose.Types.ObjectId.isValid(clientId),
+      isAdminSelfApproval: isAdminSelfApproval,
+      effectiveClientId: effectiveClientId
     });
 
     // 7. Find or create client product
-    console.log(`[RELIABLE-APPROVE] Searching for existing client product with name "${adminProduct.name}" and clientId "${clientObjectId}"`);
+    console.log(`[RELIABLE-APPROVE] Searching for existing client product with name "${adminProduct.name}" and clientId "${effectiveClientId}"`);
     
     // Try different queries to find an existing client product
     let clientProductQueries = [
-      // Query 1: Simple match by name and createdBy with converted ObjectId
+      // Query 1: Simple match by name and createdBy with effective client ID
       { 
         name: adminProduct.name, 
-        createdBy: clientObjectId 
+        createdBy: effectiveClientId 
       },
-      // Query 2: Match by name and string clientId
-      { 
-        name: adminProduct.name, 
-        createdBy: clientId 
-      },
-      // Query 3: Match by name and clientInventory with objectId
+      // Query 2: Match by name and clientInventory with effective client ID
       { 
         name: adminProduct.name, 
         'clientInventory.initialStock': { $exists: true }, 
-        createdBy: clientObjectId 
-      },
-      // Query 4: Match by name and clientInventory with string clientId
-      { 
-        name: adminProduct.name, 
-        'clientInventory.initialStock': { $exists: true }, 
-        createdBy: clientId 
+        createdBy: effectiveClientId 
       }
     ];
     
@@ -739,7 +843,7 @@ router.post('/purchase-requests/:id/reliable-approve', authMiddleware, async (re
     
     // If client product doesn't exist, create one
     if (!clientProduct) {
-      console.log(`[RELIABLE-APPROVE] Creating new client product for client ${clientObjectId || clientId}`);
+      console.log(`[RELIABLE-APPROVE] Creating new client product for client ${effectiveClientId}`);
       isNewClientProduct = true;
       
       // Generate a unique SKU with timestamp
@@ -756,7 +860,7 @@ router.post('/purchase-requests/:id/reliable-approve', authMiddleware, async (re
         loyaltyPoints: adminProduct.loyaltyPoints,
         stock: request.quantity, // Set regular stock as well for clients that might use it
         isClientUploaded: true,
-        createdBy: clientObjectId || clientId, // Use converted ObjectId if available
+        createdBy: effectiveClientId, // Use effective client ID
         organizationId: request.organizationId || adminProduct.organizationId,
         images: adminProduct.images || [],
         specifications: adminProduct.specifications || [],
@@ -813,7 +917,23 @@ router.post('/purchase-requests/:id/reliable-approve', authMiddleware, async (re
       const savedAdminProduct = await adminProduct.save();
       console.log(`[RELIABLE-APPROVE] Admin product stock updated: ${previousAdminStock} -> ${savedAdminProduct.stock}`);
       
-      // Step 3: Update purchase request status
+      // Step 3: Create inventory transaction record
+      const transaction = new InventoryTransaction({
+        transactionType: 'client_allocation',
+        productId: adminProduct._id,
+        quantity: request.quantity,
+        previousQuantity: previousAdminStock,
+        newQuantity: adminProduct.stock,
+        userId: req.user._id,
+        clientId: clientId,
+        purchaseRequestId: request._id,
+        notes: `Stock allocation from purchase request ${request._id}${isAdminSelfApproval ? ' (admin self-approval)' : ''}`
+      });
+      
+      await transaction.save();
+      console.log(`[RELIABLE-APPROVE] Inventory transaction recorded, ID: ${transaction._id}`);
+      
+      // Step 4: Update purchase request status
       request.status = 'approved';
       const savedRequest = await request.save();
       console.log(`[RELIABLE-APPROVE] Purchase request status updated to approved, ID: ${savedRequest._id}`);
@@ -837,7 +957,8 @@ router.post('/purchase-requests/:id/reliable-approve', authMiddleware, async (re
           name: savedClientProduct.name,
           stock: savedClientProduct.clientInventory?.currentStock,
           isNew: isNewClientProduct
-        }
+        },
+        isAdminSelfApproval: isAdminSelfApproval
       });
     } catch (dbError) {
       console.error('[RELIABLE-APPROVE] Database operation failed:', dbError);
@@ -869,6 +990,191 @@ router.get('/categories/list', authMiddleware, async (req, res) => {
     res.status(500).json({ message: 'Server error' });
   }
 });
+
+// @route    GET /api/products/debug-client-inventory
+// @desc     Debug endpoint to directly fetch client inventory data
+// @access   Private
+router.get('/debug-client-inventory', authMiddleware, async (req, res) => {
+  try {
+    const { clientId } = req.query;
+    
+    if (!clientId) {
+      return res.status(400).json({ message: 'Client ID is required' });
+    }
+    
+    console.log(`[DEBUG] Fetching inventory data for client: ${clientId}`);
+    
+    // Get client's products with clientInventory data
+    const clientProducts = await Product.find({
+      createdBy: clientId,
+      isClientUploaded: true
+    });
+    
+    console.log(`[DEBUG] Found ${clientProducts.length} client products`);
+    
+    // Get client's approved purchase requests
+    const approvedRequests = await PurchaseRequest.find({
+      clientId,
+      status: 'approved'
+    })
+    .populate('productId', 'name sku price images category')
+    .sort({ updatedAt: -1 });
+    
+    console.log(`[DEBUG] Found ${approvedRequests.length} approved purchase requests`);
+    
+    // Return debug information
+    res.json({
+      success: true,
+      clientId,
+      clientProducts: clientProducts.length,
+      approvedRequests: approvedRequests.length,
+      products: clientProducts.map(item => ({
+        id: item._id,
+        productId: item._id,
+        productName: item.name || 'Unknown Product',
+        currentQuantity: item.clientInventory?.currentStock || item.stock || 0,
+        allocatedQuantity: item.clientInventory?.initialStock || item.stock || 0,
+        lastUpdated: item.updatedAt
+      })),
+      requests: approvedRequests.map(req => ({
+        id: req._id,
+        productId: req.productId?._id,
+        productName: req.productName || req.productId?.name,
+        quantity: req.quantity,
+        approvedDate: req.updatedAt
+      }))
+    });
+  } catch (err) {
+    console.error('Error in debug-client-inventory:', err);
+    res.status(500).json({ message: 'Server error', error: err.message });
+  }
+});
+
+// @route    POST /api/products/repair-client-inventory
+// @desc     Repair client inventory by syncing with approved purchase requests
+// @access   Private
+router.post('/repair-client-inventory', authMiddleware, async (req, res) => {
+  try {
+    const { clientId, forceRebuild } = req.body;
+    
+    if (!clientId) {
+      return res.status(400).json({ message: 'Client ID is required' });
+    }
+    
+    console.log(`[REPAIR] Repairing inventory for client: ${clientId}, forceRebuild: ${forceRebuild}`);
+    
+    // If force rebuild is enabled, delete all existing client inventory records
+    if (forceRebuild) {
+      console.log(`[REPAIR] Force rebuild enabled, deleting existing inventory records`);
+      await ClientInventory.deleteMany({ clientId });
+    }
+    
+    // Get all approved purchase requests for this client
+    const approvedRequests = await PurchaseRequest.find({
+      clientId,
+      status: 'approved'
+    })
+    .populate('productId', 'name sku price images category reorderLevel')
+    .sort({ updatedAt: 1 }); // Process oldest first
+    
+    console.log(`[REPAIR] Found ${approvedRequests.length} approved purchase requests to process`);
+    
+    // Process each approved request
+    const results = [];
+    
+    for (const request of approvedRequests) {
+      try {
+        // Skip if product doesn't exist
+        if (!request.productId) {
+          console.log(`[REPAIR] Skipping request ${request._id} - product not found`);
+          results.push({
+            requestId: request._id,
+            status: 'skipped',
+            reason: 'Product not found'
+          });
+          continue;
+        }
+        
+        // Find or create client inventory record
+        let clientInventory = await ClientInventory.findOne({
+          clientId,
+          productId: request.productId._id
+        });
+        
+        let isNew = false;
+        
+        if (!clientInventory) {
+          console.log(`[REPAIR] Creating new inventory record for product ${request.productId.name}`);
+          isNew = true;
+          
+          clientInventory = new ClientInventory({
+            clientId,
+            productId: request.productId._id,
+            allocatedQuantity: request.quantity,
+            currentQuantity: request.quantity,
+            reorderLevel: request.productId.reorderLevel || 5,
+            purchaseDate: request.updatedAt || request.createdAt,
+            purchaseRequestId: request._id,
+            notes: `Repaired allocation from purchase request ${request._id}`
+          });
+        } else if (forceRebuild) {
+          // If rebuilding, add to existing quantities
+          console.log(`[REPAIR] Updating existing inventory record for ${request.productId.name}`);
+          clientInventory.allocatedQuantity += request.quantity;
+          clientInventory.currentQuantity += request.quantity;
+        } else {
+          // If not rebuilding and record exists, skip
+          console.log(`[REPAIR] Inventory record already exists for ${request.productId.name}, skipping`);
+          results.push({
+            requestId: request._id,
+            inventoryId: clientInventory._id,
+            status: 'skipped',
+            reason: 'Inventory record already exists'
+          });
+          continue;
+        }
+        
+        // Add history entry
+        clientInventory.addHistoryEntry(
+          'allocation',
+          request.quantity,
+          null, // No user ID for system repair
+          `Repair allocation from purchase request ${request._id}`
+        );
+        
+        // Save the inventory record
+        await clientInventory.save();
+        
+        results.push({
+          requestId: request._id,
+          inventoryId: clientInventory._id,
+          status: 'success',
+          isNew,
+          quantity: request.quantity
+        });
+      } catch (itemError) {
+        console.error(`[REPAIR] Error processing request ${request._id}:`, itemError);
+        results.push({
+          requestId: request._id,
+          status: 'error',
+          error: itemError.message
+        });
+      }
+    }
+    
+    // Return repair results
+    res.json({
+      success: true,
+      clientId,
+      processed: approvedRequests.length,
+      results
+    });
+  } catch (err) {
+    console.error('Error in repair-client-inventory:', err);
+    res.status(500).json({ message: 'Server error', error: err.message });
+  }
+});
+
 
 // @route    GET /api/products/:id
 // @desc     Get a product by ID
@@ -1203,255 +1509,141 @@ router.get('/purchase-requests/:id/check', authMiddleware, async (req, res) => {
   }
 });
 
-// @route    GET /api/products/debug-client-inventory
-// @desc     Debug endpoint to directly check for client inventory
-// @access   Private
-router.get('/debug-client-inventory', authMiddleware, async (req, res) => {
+// @route    GET /api/products/client-products
+// @desc     Get client's approved products inventory
+// @access   Private (Client only)
+router.get('/client-products', authMiddleware, async (req, res) => {
   try {
-    const { clientId } = req.query;
-    console.log(`[DEBUG] Direct client inventory lookup for client: ${clientId}`);
-    
-    if (!clientId) {
-      return res.status(400).json({ message: 'ClientId is required' });
+    // Ensure user is a client
+    if (req.user.role !== 'client' && req.user.role !== 'client_admin') {
+      return res.status(403).json({ message: 'Access denied. Client privileges required.' });
     }
-    
-    // Convert clientId to ObjectId if possible
-    let clientObjectId = null;
-    if (mongoose.Types.ObjectId.isValid(clientId)) {
-      clientObjectId = new mongoose.Types.ObjectId(clientId);
-      console.log(`[DEBUG] Converted clientId to ObjectId: ${clientObjectId}`);
-    }
-    
-    // Try multiple queries to find any possible client products
-    const queries = [
-      // Direct createdBy match with ObjectId
-      ...(clientObjectId ? [{ createdBy: clientObjectId }] : []),
-      // Direct createdBy match with string
-      { createdBy: clientId },
-      // Any product with this client's inventory
-      ...(clientObjectId ? [{ 'clientInventory.initialStock': { $exists: true }, createdBy: clientObjectId }] : []),
-      { 'clientInventory.initialStock': { $exists: true }, createdBy: clientId },
-      // Any product marked as client uploaded for this client
-      ...(clientObjectId ? [{ isClientUploaded: true, createdBy: clientObjectId }] : []),
-      { isClientUploaded: true, createdBy: clientId }
-    ];
-    
-    console.log(`[DEBUG] Will try ${queries.length} different queries`);
-    
-    // Execute all queries and merge results
-    const allProducts = [];
-    const seenIds = new Set();
-    
-    for (let i = 0; i < queries.length; i++) {
-      const query = queries[i];
-      console.log(`[DEBUG] Executing query #${i+1}:`, JSON.stringify(query));
-      
-      try {
-        const products = await Product.find(query);
-        console.log(`[DEBUG] Query #${i+1} found ${products.length} products`);
-        
-        // Add only products we haven't seen before
-        for (const product of products) {
-          if (!seenIds.has(product._id.toString())) {
-            allProducts.push(product);
-            seenIds.add(product._id.toString());
-          }
-        }
-      } catch (err) {
-        console.error(`[DEBUG] Error in query #${i+1}:`, err.message);
-      }
-    }
-    
-    console.log(`[DEBUG] Final result: ${allProducts.length} unique client products found`);
-    
-    // If we found products, log details of the first one
-    if (allProducts.length > 0) {
-      const sample = allProducts[0];
-      console.log('[DEBUG] Sample product:', {
-        id: sample._id,
-        name: sample.name,
-        createdBy: sample.createdBy,
-        isClientUploaded: sample.isClientUploaded,
-        clientInventory: sample.clientInventory
-      });
-    }
-    
-    return res.json({
-      message: `Found ${allProducts.length} client products`,
-      products: allProducts
-    });
-  } catch (err) {
-    console.error('[DEBUG] Error in debug endpoint:', err);
-    res.status(500).json({ message: 'Server error', error: err.message });
-  }
-});
 
-// @route    POST /api/products/repair-client-inventory
-// @desc     Force repair client inventory based on approved purchase requests
-// @access   Private
-router.post('/repair-client-inventory', authMiddleware, async (req, res) => {
-  try {
-    const { clientId, forceRebuild = false } = req.body;
+    console.log(`Fetching approved products for client: ${req.user._id}, role: ${req.user.role}`);
     
-    console.log(`[REPAIR] Starting client inventory repair for client: ${clientId}`);
-    console.log(`[REPAIR] Force rebuild: ${forceRebuild}`);
-    
-    // Validate client ID
-    if (!clientId) {
-      return res.status(400).json({ message: 'ClientId is required' });
-    }
-    
-    // Convert clientId to ObjectId if possible
-    let clientObjectId = clientId;
-    if (mongoose.Types.ObjectId.isValid(clientId)) {
-      clientObjectId = new mongoose.Types.ObjectId(clientId);
-      console.log(`[REPAIR] Converted clientId to ObjectId: ${clientObjectId}`);
-    }
-    
-    // Step 1: Find all approved purchase requests for this client
+    // 1. Get client's approved purchase requests
     const approvedRequests = await PurchaseRequest.find({
-      clientId: clientObjectId,
+      clientId: req.user._id,
       status: 'approved'
-    }).populate('productId');
-    
-    console.log(`[REPAIR] Found ${approvedRequests.length} approved purchase requests`);
-    
-    if (approvedRequests.length === 0) {
-      return res.status(404).json({ 
-        message: 'No approved purchase requests found for this client',
-        success: false
-      });
-    }
-    
-    // Step 2: Process each approved request to update client inventory
-    const results = {
-      created: 0,
-      updated: 0,
-      failed: 0,
-      products: []
-    };
-    
-    for (const request of approvedRequests) {
-      try {
-        // Skip if product is missing
-        if (!request.productId) {
-          console.log(`[REPAIR] Skipping request ${request._id} - missing product`);
-          results.failed++;
-          continue;
-        }
-        
-        // Get the product details
-        const adminProduct = typeof request.productId === 'object' 
-          ? request.productId 
-          : await Product.findById(request.productId);
-          
-        if (!adminProduct) {
-          console.log(`[REPAIR] Skipping request ${request._id} - product not found`);
-          results.failed++;
-          continue;
-        }
-        
-        // Try to find existing client product
-        let clientProduct = await Product.findOne({
-          name: adminProduct.name,
-          createdBy: clientObjectId
-        });
-        
-        if (clientProduct) {
-          // Update existing client product
-          console.log(`[REPAIR] Updating existing client product: ${clientProduct._id} (${clientProduct.name})`);
-          
-          // Create clientInventory if it doesn't exist
-          if (!clientProduct.clientInventory) {
-            clientProduct.clientInventory = {
-              initialStock: 0,
-              currentStock: 0,
-              reorderLevel: adminProduct.reorderLevel || 5,
-              lastUpdated: new Date()
-            };
-          }
-          
-          if (forceRebuild) {
-            // Reset inventory and add request quantity
-            clientProduct.clientInventory.currentStock = request.quantity;
-            clientProduct.clientInventory.initialStock = request.quantity;
-          } else {
-            // Add to current stock
-            clientProduct.clientInventory.currentStock += request.quantity;
-            if (!clientProduct.clientInventory.initialStock) {
-              clientProduct.clientInventory.initialStock = request.quantity;
-            }
-          }
-          
-          clientProduct.clientInventory.lastUpdated = new Date();
-          clientProduct.isClientUploaded = true;
-          
-          await clientProduct.save();
-          results.updated++;
-          results.products.push({
-            id: clientProduct._id,
-            name: clientProduct.name,
-            stock: clientProduct.clientInventory.currentStock,
-            action: 'updated'
-          });
-        } else {
-          // Create new client product
-          console.log(`[REPAIR] Creating new client product for: ${adminProduct.name}`);
-          
-          const newClientProduct = new Product({
-            name: adminProduct.name,
-            description: adminProduct.description,
-            sku: adminProduct.sku,
-            category: adminProduct.category,
-            price: adminProduct.price,
-            loyaltyPoints: adminProduct.loyaltyPoints,
-            stock: request.quantity, // Set base stock
-            reorderLevel: adminProduct.reorderLevel,
-            images: adminProduct.images,
-            specifications: adminProduct.specifications,
-            status: 'active',
-            organizationId: req.user.organizationId,
-            createdBy: clientObjectId,
-            isClientUploaded: true,
-            clientInventory: {
-              initialStock: request.quantity,
-              currentStock: request.quantity,
-              reorderLevel: adminProduct.reorderLevel || 5,
-              lastUpdated: new Date()
-            }
-          });
-          
-          await newClientProduct.save();
-          results.created++;
-          results.products.push({
-            id: newClientProduct._id,
-            name: newClientProduct.name,
-            stock: request.quantity,
-            action: 'created'
-          });
-        }
-      } catch (requestErr) {
-        console.error(`[REPAIR] Error processing request ${request._id}:`, requestErr);
-        results.failed++;
-      }
-    }
-    
-    console.log(`[REPAIR] Repair completed. Created: ${results.created}, Updated: ${results.updated}, Failed: ${results.failed}`);
-    
-    // Set a flag to force inventory refresh on client side
-    results.forceRefresh = true;
-    
-    return res.json({
-      message: 'Client inventory repair completed',
-      success: true,
-      results
+    })
+    .populate('productId', 'name sku price description category images reorderLevel')
+    .sort({ updatedAt: -1 });
+
+    console.log(`Found ${approvedRequests.length} approved purchase requests for client ${req.user._id}`);
+
+    // 2. Find client's products (products with clientInventory data)
+    const clientProducts = await Product.find({
+      isClientUploaded: true,
+      'clientInventory.currentStock': { $gt: 0 },
+      createdBy: req.user._id
     });
-  } catch (err) {
-    console.error('[REPAIR] Error repairing client inventory:', err);
+
+    console.log(`Found ${clientProducts.length} client products with inventory data`);
+    
+    // 3. Merge approved request data with client products
+    // Track products by ID to avoid duplicates
+    const productMap = {};
+    
+    // Process approved requests
+    approvedRequests.forEach(request => {
+      if (!request.productId) return;
+      
+      const productId = typeof request.productId === 'object' ? 
+        request.productId._id.toString() : request.productId.toString();
+      
+      if (!productMap[productId]) {
+        // First time seeing this product
+        productMap[productId] = {
+          id: productId,
+          name: request.productName || (request.productId?.name) || 'Unknown Product',
+          sku: request.productId?.sku || 'N/A',
+          description: request.productId?.description || '',
+          category: request.productId?.category || 'General',
+          price: request.price || request.productId?.price || 0,
+          images: request.productId?.images || [],
+          stock: request.quantity || 0,
+          reorderLevel: request.productId?.reorderLevel || 5,
+          lastUpdated: request.updatedAt,
+          purchaseDate: request.updatedAt,
+          originalProductId: productId
+        };
+      } else {
+        // Add to existing product's stock
+        productMap[productId].stock += request.quantity || 0;
+        
+        // Update last updated if this request is newer
+        if (request.updatedAt > productMap[productId].lastUpdated) {
+          productMap[productId].lastUpdated = request.updatedAt;
+        }
+      }
+    });
+    
+    // Process client products
+    clientProducts.forEach(product => {
+      const productId = product._id.toString();
+      
+      if (!productMap[productId]) {
+        // First time seeing this product
+        productMap[productId] = {
+          id: productId,
+          name: product.name || 'Unknown Product',
+          sku: product.sku || 'N/A',
+          description: product.description || '',
+          category: product.category || 'General',
+          price: product.price || 0,
+          images: product.images || [],
+          stock: product.clientInventory?.currentStock || product.stock || 0,
+          reorderLevel: product.clientInventory?.reorderLevel || product.reorderLevel || 5,
+          lastUpdated: product.clientInventory?.lastUpdated || product.updatedAt,
+          purchaseDate: product.createdAt,
+          originalProductId: product.originalProductId || productId
+        };
+      }
+      // If already in map from approved requests, client product data takes precedence
+      else {
+        productMap[productId].stock = product.clientInventory?.currentStock || product.stock || productMap[productId].stock;
+        productMap[productId].reorderLevel = product.clientInventory?.reorderLevel || product.reorderLevel || productMap[productId].reorderLevel;
+      }
+    });
+    
+    // Add sample products if no products found (for development)
+    if (Object.keys(productMap).length === 0) {
+      console.log('No products found for client, adding sample product');
+      productMap['sample-1'] = {
+        id: 'sample-1',
+        name: 'Sample Product',
+        sku: 'SAMPLE-001',
+        description: 'This is a sample product for testing',
+        category: 'Demo',
+        price: 99.99,
+        images: [],
+        stock: 10,
+        reorderLevel: 3,
+        lastUpdated: new Date(),
+        purchaseDate: new Date(),
+        originalProductId: 'sample-1'
+      };
+    }
+    
+    // Convert map to array
+    const products = Object.values(productMap);
+    
+    // Calculate total approved stock
+    const totalApprovedStock = products.reduce((sum, product) => sum + (product.stock || 0), 0);
+
+    // Return combined inventory data
+    res.json({
+      success: true,
+      totalItems: products.length,
+      totalApprovedStock,
+      products,
+      lastUpdated: new Date()
+    });
+  } catch (error) {
+    console.error('Error fetching client products:', error);
     res.status(500).json({ 
-      message: 'Server error during inventory repair',
-      success: false,
-      error: err.message 
+      message: 'Server error while fetching client products',
+      error: error.message
     });
   }
 });

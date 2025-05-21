@@ -77,17 +77,17 @@ export const getProducts = async (filters: ProductFilters = {}) => {
     currentUser ? { id: currentUser.id, role: currentUser.role, organizationId: currentUser.organizationId } : 'No user found');
     
   if (currentUser?.role === 'client') {
-    // Special handling for client users to ensure we get their inventory
-    console.log('TRACE: Client user detected, adding client-specific filters');
+    // For client users, we want to show both admin products and their own products
+    console.log('TRACE: Client user detected, setting up client-specific filters');
     
     // Always include the client ID for filtering
     requestFilters.clientId = currentUser.id;
     
-    // Set hasClientInventory to true to look for products with clientInventory fields
-    requestFilters.hasClientInventory = true;
+    // Don't restrict to only client inventory - show all products
+    delete requestFilters.hasClientInventory;
     
-    // Force include created products
-    requestFilters.isClientUploaded = true;
+    // Don't restrict to only client uploaded - show all products
+    delete requestFilters.isClientUploaded;
   }
   
   // Add query string parameters
@@ -138,58 +138,11 @@ export const getProducts = async (filters: ProductFilters = {}) => {
         stock: sample.stock,
         hasClientInventory: !!sample.clientInventory,
         clientStock: sample.clientInventory?.currentStock,
-        createdBy: sample.createdBy
+        createdBy: sample.createdBy,
+        isClientUploaded: sample.isClientUploaded
       });
     } else {
       console.log('TRACE: No products returned');
-      
-      // If client user and no products, try with different filters as fallback
-      if (currentUser?.role === 'client') {
-        console.log('TRACE: Client user with no products, trying direct lookup by createdBy');
-        
-        // Try a direct lookup as fallback
-        const fallbackResponse = await fetch(`/api/products?createdBy=${currentUser.id}&_t=${Date.now()}`, {
-          method: 'GET',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${localStorage.getItem('token')}`,
-            'X-Client-ID': currentUser.id
-          }
-        });
-        
-        if (fallbackResponse.ok) {
-          const fallbackData = await fallbackResponse.json();
-          console.log(`TRACE: Fallback returned ${fallbackData.products?.length || 0} products`);
-          
-          if (fallbackData.products && fallbackData.products.length > 0) {
-            return fallbackData;
-          }
-        }
-        
-        // Last resort - try debug endpoint
-        console.log('TRACE: Trying debug endpoint as last resort');
-        const debugResponse = await fetch(`/api/products/debug-client-inventory?clientId=${currentUser.id}&_t=${Date.now()}`, {
-              method: 'GET',
-              headers: {
-                'Content-Type': 'application/json',
-            'Authorization': `Bearer ${localStorage.getItem('token')}`,
-            'X-Client-ID': currentUser.id
-          }
-        });
-        
-        if (debugResponse.ok) {
-          const debugData = await debugResponse.json();
-          console.log(`TRACE: Debug endpoint found ${debugData.products?.length || 0} products`);
-          
-          if (debugData.products && debugData.products.length > 0) {
-            // Convert debug format to regular API response format
-            return {
-              products: debugData.products,
-              pagination: { total: debugData.products.length, page: 1, limit: 50, pages: 1 }
-            };
-          }
-        }
-      }
     }
     
     return data;
@@ -470,6 +423,51 @@ export const rejectPurchaseRequest = async (id: string, reason: string) => {
     return response;
   } catch (error) {
     console.error(`Error rejecting purchase request ${id}:`, error);
+    throw error;
+  }
+};
+
+// Client Inventory Functions
+
+// Define ClientProduct interface
+export interface ClientProduct {
+  id: string;
+  name: string;
+  sku: string;
+  description: string;
+  category: string;
+  price: number;
+  stock: number;
+  reorderLevel: number;
+  lastUpdated: string;
+  purchaseDate: string;
+  originalProductId: string;
+  images?: string[];
+}
+
+// Define ClientProductResponse interface
+export interface ClientProductResponse {
+  success: boolean;
+  totalItems: number;
+  totalApprovedStock: number;
+  products: ClientProduct[];
+  lastUpdated: string;
+}
+
+/**
+ * Get client products inventory data
+ * @returns Promise with client products inventory data
+ */
+export const getClientProducts = async (): Promise<ClientProductResponse> => {
+  try {
+    console.log('Fetching client products data from API...');
+    
+    const response = await apiRequest<ClientProductResponse>('products/client-products', 'GET');
+    console.log('Client products API response:', response);
+    
+    return response;
+  } catch (error) {
+    console.error('Error fetching client products:', error);
     throw error;
   }
 };
